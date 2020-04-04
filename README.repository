@@ -1,0 +1,4 @@
+Zephyr USB-CDC sample for nRF52840 without nRF5 BootLoader
+
+https://github.com/svenssonjoel/lispBM/blob/master/repl-zephyr/src/main.c
+https://github.com/zephyrproject-rtos/zephyr/tree/master/samples/subsys/usb/cdc_acm

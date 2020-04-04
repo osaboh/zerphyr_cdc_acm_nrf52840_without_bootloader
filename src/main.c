@@ -1,31 +1,35 @@
 /*
- * Copyright (c) 2019 Intel Corporation
- *
- * SPDX-License-Identifier: Apache-2.0
- */
+    Copyright 2019 Joel Svensson	svenssonjoel@yahoo.se
 
-/**
- * @file
- * @brief Sample echo app for CDC ACM class
- *
- * Sample app for USB CDC ACM class driver. The received data is echoed back
- * to the serial port.
- */
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
 
-#include <stdio.h>
-#include <string.h>
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
 #include <device.h>
 #include <drivers/uart.h>
 #include <zephyr.h>
 #include <sys/ring_buffer.h>
 
-#include <logging/log.h>
-LOG_MODULE_REGISTER(cdc_acm_echo, LOG_LEVEL_INF);
+#include <stdio.h>
 
 #define RING_BUF_SIZE 1024
-u8_t ring_buffer[RING_BUF_SIZE];
+u8_t in_ring_buffer[RING_BUF_SIZE];
+u8_t out_ring_buffer[RING_BUF_SIZE];
 
-struct ring_buf ringbuf;
+struct device *dev;
+
+struct ring_buf in_ringbuf;
+struct ring_buf out_ringbuf;
 
 static void interrupt_handler(struct device *dev)
 {
@@ -33,93 +37,153 @@ static void interrupt_handler(struct device *dev)
 		if (uart_irq_rx_ready(dev)) {
 			int recv_len, rb_len;
 			u8_t buffer[64];
-			size_t len = MIN(ring_buf_space_get(&ringbuf),
-					 sizeof(buffer));
+			size_t len = MIN(ring_buf_space_get(&in_ringbuf),
+							 sizeof(buffer));
 
 			recv_len = uart_fifo_read(dev, buffer, len);
 
-			rb_len = ring_buf_put(&ringbuf, buffer, recv_len);
+			rb_len = ring_buf_put(&in_ringbuf, buffer, recv_len);
 			if (rb_len < recv_len) {
-				LOG_ERR("Drop %u bytes", recv_len - rb_len);
+				//silently dropping bytes
 			}
-
-			LOG_DBG("tty fifo -> ringbuf %d bytes", rb_len);
-
-			uart_irq_tx_enable(dev);
 		}
 
 		if (uart_irq_tx_ready(dev)) {
 			u8_t buffer[64];
 			int rb_len, send_len;
 
-			rb_len = ring_buf_get(&ringbuf, buffer, sizeof(buffer));
+			rb_len = ring_buf_get(&out_ringbuf, buffer, sizeof(buffer));
 			if (!rb_len) {
-				LOG_DBG("Ring buffer empty, disable TX IRQ");
 				uart_irq_tx_disable(dev);
 				continue;
 			}
 
 			send_len = uart_fifo_fill(dev, buffer, rb_len);
 			if (send_len < rb_len) {
-				LOG_ERR("Drop %d bytes", rb_len - send_len);
 			}
-
-			LOG_DBG("ringbuf -> tty fifo %d bytes", send_len);
 		}
 	}
 }
 
+int get_char() {
+
+	int n;
+	u8_t c;
+	unsigned int key = irq_lock();
+	n = ring_buf_get(&in_ringbuf, &c, 1);
+	irq_unlock(key);
+	if (n == 1) {
+		return c;
+	}
+	return -1;
+}
+
+void put_char(int i) {
+	if (i >= 0 && i < 256) {
+
+		u8_t c = (u8_t)i;
+		unsigned int key = irq_lock();
+		ring_buf_put(&out_ringbuf, &c, 1);
+		uart_irq_tx_enable(dev);
+		irq_unlock(key);
+	}
+}
+
+void usb_printf(char *format, ...) {
+
+	va_list arg;
+	va_start(arg, format);
+	int len;
+	static char print_buffer[4096];
+
+	len = vsnprintf(print_buffer, 4096,format, arg);
+	va_end(arg);
+
+	int num_written = 0;
+	while (len - num_written > 0) {
+		unsigned int key = irq_lock();
+		num_written +=
+			ring_buf_put(&out_ringbuf,
+						 (print_buffer + num_written),
+						 (len - num_written));
+		irq_unlock(key);
+		uart_irq_tx_enable(dev);
+	}
+}
+
+
+int inputline(char *buffer, int size) {
+	int n = 0;
+	int c;
+	for (n = 0; n < size - 1; n++) {
+
+		c = get_char();
+		switch (c) {
+		case 127: /* fall through to below */
+		case '\b': /* backspace character received */
+			if (n > 0)
+				n--;
+			buffer[n] = 0;
+			put_char('\b'); /* output backspace character */
+			n--; /* set up next iteration to deal with preceding char location */
+			break;
+		case '\n': /* fall through to \r */
+		case '\r':
+			buffer[n] = 0;
+			return n;
+		default:
+			if (c != -1 && c < 256) {
+				put_char(c);
+				buffer[n] = c;
+			} else {
+				n --;
+			}
+
+			break;
+		}
+	}
+	buffer[size - 1] = 0;
+	return 0; // Filled up buffer without reading a linebreak
+}
+
 void main(void)
 {
-	struct device *dev;
+
 	u32_t baudrate, dtr = 0U;
-	int ret;
 
 	dev = device_get_binding("CDC_ACM_0");
 	if (!dev) {
-		LOG_ERR("CDC ACM device not found");
 		return;
 	}
 
-	ring_buf_init(&ringbuf, sizeof(ring_buffer), ring_buffer);
-
-	LOG_INF("Wait for DTR");
+	ring_buf_init(&in_ringbuf, sizeof(in_ring_buffer), in_ring_buffer);
+	ring_buf_init(&out_ringbuf, sizeof(out_ring_buffer), out_ring_buffer);
 
 	while (true) {
 		uart_line_ctrl_get(dev, UART_LINE_CTRL_DTR, &dtr);
 		if (dtr) {
 			break;
 		} else {
-			/* Give CPU resources to low priority threads. */
-			k_sleep(K_MSEC(100));
+			k_sleep(100);
 		}
 	}
 
-	LOG_INF("DTR set");
+	uart_line_ctrl_set(dev, UART_LINE_CTRL_DCD, 1);
+	uart_line_ctrl_set(dev, UART_LINE_CTRL_DSR, 1);
 
-	/* They are optional, we use them to test the interrupt endpoint */
-	ret = uart_line_ctrl_set(dev, UART_LINE_CTRL_DCD, 1);
-	if (ret) {
-		LOG_WRN("Failed to set DCD, ret code %d", ret);
-	}
-
-	ret = uart_line_ctrl_set(dev, UART_LINE_CTRL_DSR, 1);
-	if (ret) {
-		LOG_WRN("Failed to set DSR, ret code %d", ret);
-	}
-
-	/* Wait 1 sec for the host to do all settings */
 	k_busy_wait(1000000);
 
-	ret = uart_line_ctrl_get(dev, UART_LINE_CTRL_BAUD_RATE, &baudrate);
-	if (ret) {
-		LOG_WRN("Failed to get baudrate, ret code %d", ret);
-	} else {
-		LOG_INF("Baudrate detected: %d", baudrate);
-	}
+	uart_line_ctrl_get(dev, UART_LINE_CTRL_BAUD_RATE, &baudrate);
 
 	uart_irq_callback_set(dev, interrupt_handler);
 
-	/* Enable rx interrupts */
 	uart_irq_rx_enable(dev);
+
+	usb_printf("Allocating input/output buffers\n\r");
+
+	while (1) {
+		usb_printf("Lisp REPL started (ZephyrOS)!\n\r");
+		k_sleep(500);
+	}
+
 }
